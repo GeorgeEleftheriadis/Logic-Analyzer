@@ -1,18 +1,19 @@
 /**
- * ESP32 Multi-Protocol Logic Analyzer v1.0
+ * ESP32 Ultimate Logic Analyzer v2
  * Author: Tomberar
  *
  * Features:
- * - Capture I2C, SPI, UART signals
- * - Buffered capture for high-speed sampling (~1-2 MHz)
+ * - Capture and decode I2C, SPI, UART signals
+ * - Buffered capture (~1-2 MHz)
+ * - Detect I2C START/STOP + address/data
+ * - Decode SPI bytes per CS/CLK
+ * - Decode UART bytes (8N1)
  * - CSV export: sample,time,protocol,event,address/data/byte
- * - Modular: add more protocols or channels easily
  *
  * Notes:
- * - I2C: SDA=SDA_PIN, SCL=SCL_PIN
- * - SPI: CLK=SPI_CLK, MOSI=SPI_MOSI, MISO=SPI_MISO, CS=SPI_CS
- * - UART: TX=UART_TX, RX=UART_RX
- * - Pull-ups required for I2C, SPI idle HIGH recommended
+ * - Pins configurable below
+ * - Pull-ups for I2C required
+ * - Idle HIGH recommended for SPI/UART lines
  */
 
 #include <Arduino.h>
@@ -33,8 +34,8 @@
 #define UART_TX 12
 #define UART_RX 13
 
-#define SAMPLES 5000       // total samples per capture
-#define USEC_DELAY 1       // microseconds between samples
+#define SAMPLES 5000
+#define USEC_DELAY 1
 
 // ---------------------- BUFFERS ----------------------
 uint32_t timestamps[SAMPLES];
@@ -74,19 +75,18 @@ void setup() {
     pinMode(UART_TX, INPUT_PULLUP);
     pinMode(UART_RX, INPUT_PULLUP);
 
-    Serial.println("ESP32 Multi-Protocol Logic Analyzer Started");
+    Serial.println("Ultimate ESP32 Logic Analyzer Started");
 }
 
 // ---------------------- HELPER FUNCTIONS ----------------------
 
-/** Fast GPIO read for I2C */
+// Fast GPIO reads
 void readI2C(uint8_t &sda, uint8_t &scl) {
     uint32_t gpio = GPIO.in;
     sda = (gpio & (1UL << SDA_PIN)) ? 1 : 0;
     scl = (gpio & (1UL << SCL_PIN)) ? 1 : 0;
 }
 
-/** Fast GPIO read for SPI */
 void readSPI(uint8_t &clk, uint8_t &mosi, uint8_t &miso, uint8_t &cs) {
     uint32_t gpio = GPIO.in;
     clk  = (gpio & (1UL << SPI_CLK)) ? 1 : 0;
@@ -95,14 +95,13 @@ void readSPI(uint8_t &clk, uint8_t &mosi, uint8_t &miso, uint8_t &cs) {
     cs   = (gpio & (1UL << SPI_CS)) ? 1 : 0;
 }
 
-/** Fast GPIO read for UART */
 void readUART(uint8_t &tx, uint8_t &rx) {
     uint32_t gpio = GPIO.in;
     tx = (gpio & (1UL << UART_TX)) ? 1 : 0;
     rx = (gpio & (1UL << UART_RX)) ? 1 : 0;
 }
 
-/** Capture fast into buffers */
+// ---------------------- CAPTURE FUNCTIONS ----------------------
 void captureI2C() {
     i2cSampleIndex = 0;
     for (int i = 0; i < SAMPLES; i++) {
@@ -133,68 +132,92 @@ void captureUART() {
     }
 }
 
-// ---------------------- CSV EXPORT ----------------------
-void exportI2C() {
-    Serial.println("sample,time,event,address/data");
-    uint8_t prevSDA = 1, prevSCL = 1;
-    for (int i = 0; i < i2cSampleIndex; i++) {
-        uint8_t sda = sdaBuffer[i];
-        uint8_t scl = sclBuffer[i];
-        uint32_t t = timestamps[i];
+// ---------------------- DECODERS ----------------------
 
-        // START
-        if (prevSDA==1 && sda==0 && scl==1) Serial.printf("%d,%lu,START,\n", i, t);
-        // STOP
-        if (prevSDA==0 && sda==1 && scl==1) Serial.printf("%d,%lu,STOP,\n", i, t);
+// Simple I2C decoder: START/STOP + address/data
+void decodeI2C() {
+    Serial.println("sample,time,protocol,event,address/data");
+    uint8_t prevSDA=1, prevSCL=1;
+    uint8_t byteValue=0;
+    int bitCount=0;
+    bool inByte=false;
+    bool addressCaptured=false;
+    uint8_t address=0;
 
-        prevSDA = sda;
-        prevSCL = scl;
+    for (int i=0;i<i2cSampleIndex;i++){
+        uint8_t sda=sdaBuffer[i];
+        uint8_t scl=sclBuffer[i];
+        uint32_t t=timestamps[i];
+
+        if(prevSDA==1 && sda==0 && scl==1){Serial.printf("%d,%lu,I2C,START,\n",i,t); inByte=true; byteValue=0; bitCount=0; addressCaptured=false;}
+        if(prevSDA==0 && sda==1 && scl==1){Serial.printf("%d,%lu,I2C,STOP,\n",i,t); inByte=false; bitCount=0;}
+
+        if(prevSCL==0 && scl==1 && inByte){
+            byteValue=(byteValue<<1)|sda;
+            bitCount++;
+            if(bitCount==8){
+                if(!addressCaptured){address=byteValue; Serial.printf("%d,%lu,I2C,ADDRESS,0x%02X\n",i,t,address); addressCaptured=true;}
+                else Serial.printf("%d,%lu,I2C,DATA,0x%02X\n",i,t,byteValue);
+                bitCount=0; byteValue=0;
+            }
+        }
+
+        prevSDA=sda; prevSCL=scl;
     }
 }
 
-void exportSPI() {
-    Serial.println("sample,time,CLK,MOSI,MISO,CS");
-    for (int i = 0; i < spiSampleIndex; i++) {
-        Serial.printf("%d,%lu,%d,%d,%d,%d\n",
-                      i, timestamps[i],
-                      spiClkBuffer[i],
-                      spiMosiBuffer[i],
-                      spiMisoBuffer[i],
-                      spiCsBuffer[i]);
+// Simple SPI decoder: capture bytes while CS LOW
+void decodeSPI() {
+    Serial.println("sample,time,protocol,event,MOSI,MISO");
+    uint8_t prevClk=0, byteValue=0, bitCount=0;
+    bool inByte=false;
+
+    for(int i=0;i<spiSampleIndex;i++){
+        uint8_t clk=spiClkBuffer[i];
+        uint8_t mosi=spiMosiBuffer[i];
+        uint8_t miso=spiMisoBuffer[i];
+        uint8_t cs=spiCsBuffer[i];
+        uint32_t t=timestamps[i];
+
+        if(cs==0){ // active
+            if(prevClk==0 && clk==1){ // rising edge
+                byteValue=(byteValue<<1)|(mosi&1);
+                bitCount++;
+                if(bitCount==8){Serial.printf("%d,%lu,SPI,BYTE,0x%02X,0x%02X\n",i,t,byteValue,miso); byteValue=0; bitCount=0;}
+            }
+        }
+
+        prevClk=clk;
     }
 }
 
-void exportUART() {
-    Serial.println("sample,time,TX,RX");
-    for (int i = 0; i < uartSampleIndex; i++) {
-        Serial.printf("%d,%lu,%d,%d\n",
-                      i, timestamps[i],
-                      uartTxBuffer[i],
-                      uartRxBuffer[i]);
+// Simple UART decoder: 8N1, start/stop/data bits
+void decodeUART() {
+    Serial.println("sample,time,protocol,event,byte");
+    uint8_t prevTx=1, bitCount=0, byteValue=0;
+    bool inByte=false;
+
+    for(int i=0;i<uartSampleIndex;i++){
+        uint8_t tx=uartTxBuffer[i];
+        uint32_t t=timestamps[i];
+
+        if(!inByte && prevTx==1 && tx==0){ // start bit
+            inByte=true; bitCount=0; byteValue=0;
+        }
+
+        if(inByte){
+            byteValue=(byteValue>>1)|(tx<<7); // shift in LSB first
+            bitCount++;
+            if(bitCount==8){Serial.printf("%d,%lu,UART,BYTE,0x%02X\n",i,t,byteValue); inByte=false;}
+        }
+
+        prevTx=tx;
     }
 }
 
 // ---------------------- MAIN LOOP ----------------------
 void loop() {
-    // Capture and export one protocol at a time
-    captureI2C();
-    exportI2C();
-    delay(500);
-
-    captureSPI();
-    exportSPI();
-    delay(500);
-
-    captureUART();
-    exportUART();
-    delay(1000);
+    captureI2C(); decodeI2C(); delay(500);
+    captureSPI(); decodeSPI(); delay(500);
+    captureUART(); decodeUART(); delay(1000);
 }
-
-/**
- * ---------------------- FUTURE EXTENSIONS ----------------------
- * - Decode I2C bytes/address
- * - Decode SPI bytes with CS/CLK edges
- * - Decode UART bytes with start/stop/data bits
- * - Trigger-based capture
- * - Export combined CSV for multi-protocol visualization
- */
