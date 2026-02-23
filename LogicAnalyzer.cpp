@@ -1,6 +1,6 @@
 /**
  * ESP32 Ultimate Logic Analyzer v2
- * Author: Tomberar
+ * Author: George Eleftheriadis
  *
  * Features:
  * - Capture and decode I2C, SPI, UART signals
